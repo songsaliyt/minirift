@@ -9,7 +9,8 @@
   * { box-sizing: border-box; }
   html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
     font-family:"Pretendard","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif; overflow:hidden; touch-action:none; }
-  canvas { display:block; width:100vw; height:100vh; }
+  canvas { position:fixed; inset:0; display:block; width:100vw; height:100vh; }
+  #c { z-index:1; }
   #join, #lobby { position:fixed; inset:0; display:grid; place-items:center; background:var(--bg); z-index:3; }
   #lobby { background:#0b1a24ee; }
   #join form, .box { width:min(420px,92vw); display:grid; gap:12px; }
@@ -35,7 +36,7 @@
 </style>
 </head>
 <body>
-<canvas id="c"></canvas>
+<canvas id="gl3"></canvas><canvas id="c"></canvas>
 <div id="msg"></div>
 <div id="hint">WASD 이동 · Q / E / Space / R 스킬(R은 Lv3부터) · 좌클릭=Q · 우클릭 이동 · Enter 채팅</div>
 <div id="skills" hidden><button id="bq">Q<i></i></button><button id="bw">E<i></i></button><button id="be">␣<i></i></button><button id="br">R<i></i></button></div>
@@ -68,15 +69,15 @@
     <button class="go">입장</button>
   </form>
 </div>
+<script src="three.min.js"></script>
 <script>
 const WS_URL = "wss://lol.ypec.site/ws";   // ← 서버 주소 (wss:// … /ws)
 
-const W = 2000, H = 500;
+const W = 2000, H = 500, YAW = 0.5, CAM_D = 440, CAM_H = 560;
 const NAMES = { xerath:"제라스", sett:"세트", yasuo:"야스오", teemo:"티모", seungwoo:"승우이" };
 const DESC = { xerath:"장거리 마법사 · 기절 스킬 + 궁극기 폭격", sett:"탱커 · 보호막, 광역 기절, 점프 궁극기", yasuo:"검객 · 돌진, 바람 장막, 광역 궁극기", teemo:"원거리 · 둔화 다트, 이속, 폭발 버섯", seungwoo:"하이브리드 · 3갈래/9갈래 발사, 회복, 돌진" };
-const COL = { b:"#4aa3ff", r:"#ff5a6a" };
+const COL = { b:"#4aa3ff", r:"#ff5a6a" }, TC = { b:0x4aa3ff, r:0xff5a6a };
 const RELICS = [[680,130],[680,370],[1320,130],[1320,370]];
-const SNOW = [...Array(110)].map((_, i) => [(i * 977) % W, (i * 613) % (H + 200) - 100, 1 + (i % 3)]);
 for (const sel of [ch, lch]) {
   if (sel === ch) sel.add(new Option("무작위 (칼바람 스타일)", "random"));
   for (const k in NAMES) sel.add(new Option(`${NAMES[k]} – ${DESC[k]}`, k));
@@ -84,41 +85,199 @@ for (const sel of [ch, lch]) {
 
 const cv = document.getElementById("c"), ctx = cv.getContext("2d");
 let ws, me = {}, snap = null, disp = new Map(), fxs = [], lsig = "";
-let dpr = 1, scale = 1, VW = 1000, cam = { x: 0, y: 0 }, mouse = { x: W/2, y: H/2 }, mini = { x:0, y:0, w:0, h:0 };
+let dpr = 1, mouse = { x: W/2, y: H/2 }, lastPtr = { x: 0, y: 0 }, mini = { x:0, y:0, w:0, h:0 };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// ================= 3D 장면 =================
+const R3 = new THREE.WebGLRenderer({ canvas: document.getElementById("gl3"), antialias: true });
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x040a12);
+scene.fog = new THREE.FogExp2(0x061522, 0.00115);
+const camera = new THREE.PerspectiveCamera(38, 1, 10, 4500);
+const camT = new THREE.Vector3(W/2, 0, H/2);
 
 function resize() {
   dpr = devicePixelRatio || 1;
   cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
-  VW = innerWidth < innerHeight ? 600 : 1000;
-  scale = cv.width / VW;
+  R3.setPixelRatio(Math.min(dpr, 1.5)); R3.setSize(innerWidth, innerHeight, false);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
   mini.w = Math.min(300 * dpr, cv.width * 0.45); mini.h = mini.w * H / W;
   mini.x = 12 * dpr; mini.y = cv.height - mini.h - 12 * dpr;
   chat.style.bottom = (mini.h / dpr + 24) + "px";
 }
 addEventListener("resize", resize); resize();
 
-const toWorld = (e) => ({ x: e.clientX * dpr / scale + cam.x, y: e.clientY * dpr / scale + cam.y });
+scene.add(new THREE.HemisphereLight(0x8cc4ff, 0x0a1824, 0.95));
+const sun = new THREE.DirectionalLight(0xcfe6ff, 0.8); sun.position.set(-300, 600, 250); scene.add(sun);
+for (const x of [150, 600, 1000, 1400, 1850]) { const l = new THREE.PointLight(0x4fd8ff, 0.9, 520); l.position.set(x, 70, H/2); scene.add(l); }
+
+let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+const M = (c, e = 0, ei = 0.4) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.7, metalness: 0.1, emissive: e, emissiveIntensity: ei });
+const B = (c, o = 1) => new THREE.MeshBasicMaterial({ color: c, transparent: o < 1, opacity: o, side: THREE.DoubleSide });
+function mesh(parent, geo, mat, x = 0, y = 0, z = 0) { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); parent.add(m); return m; }
+
+function bridgeTexture() {
+  const c = document.createElement("canvas"); c.width = c.height = 512; const g = c.getContext("2d");
+  g.fillStyle = "#2f5871"; g.fillRect(0, 0, 512, 512);
+  for (let i = 0; i < 1200; i++) { g.fillStyle = `rgba(${130 + rnd() * 90},${190 + rnd() * 60},255,${rnd() * 0.07})`; g.fillRect(rnd() * 512, rnd() * 512, 4 + rnd() * 34, 4 + rnd() * 34); }
+  g.strokeStyle = "rgba(6,18,30,.6)"; g.lineWidth = 4;
+  for (let i = 0; i <= 512; i += 128) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i, 512); g.stroke(); g.beginPath(); g.moveTo(0, i); g.lineTo(512, i); g.stroke(); }
+  g.strokeStyle = "rgba(110,225,255,.5)"; g.lineWidth = 2;
+  for (const [x, y] of [[0, 0], [256, 256]]) { g.strokeRect(x + 30, y + 30, 196, 196); g.beginPath(); g.moveTo(x + 128, y + 50); g.lineTo(x + 128, y + 206); g.moveTo(x + 50, y + 128); g.lineTo(x + 206, y + 128); g.stroke(); }
+  g.strokeStyle = "rgba(0,0,0,.35)"; g.lineWidth = 1.5;
+  for (let i = 0; i < 14; i++) { g.beginPath(); let x = rnd() * 512, y = rnd() * 512; g.moveTo(x, y); for (let k = 0; k < 5; k++) g.lineTo(x += (rnd() - .5) * 60, y += (rnd() - .5) * 60); g.stroke(); }
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4; return t;
+}
+// 다리
+const BW = W + 900, tex = bridgeTexture(); tex.repeat.set(BW / 256, 400 / 256);
+const deck = mesh(scene, new THREE.PlaneGeometry(BW, 400), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.85, metalness: 0.05 }), W/2, 0, H/2);
+deck.rotation.x = -Math.PI / 2;
+mesh(scene, new THREE.BoxGeometry(BW, 70, 400), M(0x14293a), W/2, -36, H/2);
+for (const z of [48, 452]) {
+  mesh(scene, new THREE.BoxGeometry(BW, 16, 14), M(0x1c3345), W/2, 8, z);
+  mesh(scene, new THREE.BoxGeometry(BW, 2.5, 3), B(0x6fe6ff), W/2, 17, z);
+}
+const posts = new THREE.InstancedMesh(new THREE.BoxGeometry(7, 26, 7), B(0x7aeaff), 66), dm = new THREE.Object3D();
+let pi = 0; for (let x = -400; x <= W + 400; x += 100) for (const z of [48, 452]) { dm.position.set(x, 21, z); dm.updateMatrix(); posts.setMatrixAt(pi++, dm.matrix); }
+scene.add(posts);
+// 가고일 석상
+function gargoyle(x, z, dir) {
+  const g = new THREE.Group(), st = M(0x22384a);
+  mesh(g, new THREE.BoxGeometry(34, 30, 34), st, 0, 15, 0);
+  mesh(g, new THREE.BoxGeometry(22, 26, 24), st, 0, 43, 0);
+  for (const s of [-1, 1]) { const h = mesh(g, new THREE.ConeGeometry(5, 26, 6), st, s * 11, 66, 0); h.rotation.z = -s * 0.5; mesh(g, new THREE.SphereGeometry(3.2, 8, 8), B(0xff8a3c), s * 6, 47, dir * 12); }
+  const w = mesh(g, new THREE.BoxGeometry(60, 5, 20), st, 0, 52, 0); w.rotation.z = 0.0;
+  g.position.set(x, 0, z); scene.add(g);
+}
+for (const x of [250, 650, 1050, 1450, 1850]) { gargoyle(x, 22, 1); gargoyle(x + 200, 478, -1); }
+// 절벽/얼음 기둥/종유석
+const rock = M(0x25465c), ice = M(0x4d86a6, 0x0a2a3d, 0.5);
+for (let i = 0; i < 90; i++) {
+  const x = -500 + rnd() * (W + 1000), side = rnd() < .5 ? -1 : 1, z = H/2 + side * (260 + rnd() * 700);
+  const r = 30 + rnd() * 80, h = 200 + rnd() * 700;
+  const p = mesh(scene, new THREE.CylinderGeometry(r * 0.55, r, h, 5 + (i % 3)), i % 4 ? rock : ice, x, h / 2 - 330 + rnd() * 120, z);
+  p.material.flatShading = true; p.rotation.y = rnd() * 3;
+}
+for (let i = 0; i < 70; i++) {
+  const x = -300 + rnd() * (W + 600), z = rnd() * 520 - 10, h = 120 + rnd() * 420, r = 20 + rnd() * 50;
+  const c = mesh(scene, new THREE.ConeGeometry(r, h, 6), ice, x, -40 - h / 2, z); c.rotation.x = Math.PI;
+}
+mesh(scene, new THREE.PlaneGeometry(6000, 3000), M(0x050d16), W/2, -700, H/2).rotation.x = -Math.PI / 2;
+// 샘터 / 넥서스
+const nexusObjs = {};
+for (const [x, t] of [[90, "b"], [W - 90, "r"]]) {
+  for (const [a, b2, o] of [[120, 150, 0.9], [60, 66, 0.7]]) mesh(scene, new THREE.RingGeometry(a, b2, 48), B(TC[t], o), x, 1.2, H/2).rotation.x = -Math.PI / 2;
+  mesh(scene, new THREE.CircleGeometry(150, 48), B(TC[t], 0.12), x, 1, H/2).rotation.x = -Math.PI / 2;
+  const g = new THREE.Group(); g.position.set(x, 0, H/2);
+  mesh(g, new THREE.CylinderGeometry(46, 58, 26, 8), M(0x1d3446), 0, 13, 0);
+  const cr = mesh(g, new THREE.OctahedronGeometry(36), M(TC[t], TC[t], 0.9), 0, 90, 0); cr.scale.y = 1.7;
+  mesh(g, new THREE.SphereGeometry(52, 16, 12), B(TC[t], 0.12), 0, 90, 0);
+  const l = new THREE.PointLight(TC[t], 1.3, 420); l.position.y = 90; g.add(l);
+  scene.add(g); nexusObjs[t] = { g, cr };
+}
+mesh(scene, new THREE.RingGeometry(55, 60, 48), B(0xffffff, 0.25), W/2, 1.2, H/2).rotation.x = -Math.PI / 2;
+// 눈
+const SN = 700, snowPos = new Float32Array(SN * 3);
+for (let i = 0; i < SN; i++) { snowPos[i*3] = (rnd() - .5) * 1100; snowPos[i*3+1] = rnd() * 520; snowPos[i*3+2] = (rnd() - .5) * 900; }
+const snowGeo = new THREE.BufferGeometry(); snowGeo.setAttribute("position", new THREE.BufferAttribute(snowPos, 3));
+const snow = new THREE.Points(snowGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 3, transparent: true, opacity: 0.75, depthWrite: false }));
+snow.frustumCulled = false; scene.add(snow);
+
+// ----- 타워 / 미니언 / 챔피언 -----
+const towerObjs = [];
+function makeTower(team) {
+  const g = new THREE.Group(), c = TC[team];
+  mesh(g, new THREE.CylinderGeometry(34, 42, 16, 8), M(0x1b2f40), 0, 8, 0);
+  mesh(g, new THREE.CylinderGeometry(17, 24, 92, 8), M(0x3f5a6e), 0, 62, 0);
+  mesh(g, new THREE.CylinderGeometry(28, 20, 12, 8), M(0x58778c), 0, 112, 0);
+  const cr = mesh(g, new THREE.OctahedronGeometry(15), M(c, c, 1), 0, 138, 0);
+  mesh(g, new THREE.SphereGeometry(26, 12, 10), B(c, 0.14), 0, 138, 0);
+  const range = mesh(g, new THREE.RingGeometry(266, 272, 72), B(c, 0.45), 0, 1.5, 0); range.rotation.x = -Math.PI / 2; range.visible = false;
+  const beamG = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 1, 0)]);
+  const beam = new THREE.Line(beamG, new THREE.LineBasicMaterial({ color: 0xffe27a })); beam.frustumCulled = false; beam.visible = false; scene.add(beam);
+  scene.add(g); return { g, cr, range, beam };
+}
+function makeMinion(team) {
+  const g = new THREE.Group(), c = TC[team];
+  mesh(g, new THREE.CylinderGeometry(7, 10, 20, 8), M(c, c, 0.25), 0, 11, 0);
+  mesh(g, new THREE.SphereGeometry(7, 10, 8), M(0xd9e6ee), 0, 27, 0);
+  mesh(g, new THREE.ConeGeometry(4, 8, 6), M(c, c, 0.5), 0, 36, 0);
+  g.userData.team = team; return g;
+}
+function makeChamp(k, team) {
+  const g = new THREE.Group(), tc = TC[team], body = new THREE.Group(); g.add(body);
+  mesh(g, new THREE.CircleGeometry(24, 20), B(0x000000, 0.35), 0, 0.6, 0).rotation.x = -Math.PI / 2;
+  mesh(g, new THREE.RingGeometry(22, 27, 32), B(tc), 0, 0.9, 0).rotation.x = -Math.PI / 2;
+  const skin = M(0xf0c9a4), E = (c) => M(c, tc, 0.18);
+  if (k === "xerath") {
+    mesh(body, new THREE.CylinderGeometry(7, 15, 46, 8), E(0x5b3fb8), 0, 23, 0);
+    mesh(body, new THREE.SphereGeometry(9, 12, 10), skin, 0, 54, 0);
+    mesh(body, new THREE.ConeGeometry(11, 14, 8), E(0x3a2790), 0, 68, 0);
+    const o = new THREE.Group(); body.add(o); g.userData.orbs = o;
+    for (let i = 0; i < 3; i++) { const a = i * 2.094; mesh(o, new THREE.SphereGeometry(4.5, 8, 8), M(0xffd45a, 0xffb400, 1), Math.cos(a) * 24, 42, Math.sin(a) * 24); }
+  } else if (k === "sett") {
+    mesh(body, new THREE.BoxGeometry(34, 34, 22), E(0xc7742f), 0, 32, 0);
+    mesh(body, new THREE.BoxGeometry(26, 15, 16), E(0x40403f), 0, 8, 0);
+    for (const s of [-1, 1]) mesh(body, new THREE.BoxGeometry(12, 28, 12), skin, s * 23, 32, 0);
+    mesh(body, new THREE.BoxGeometry(16, 16, 16), skin, 0, 58, 0);
+    mesh(body, new THREE.BoxGeometry(18, 7, 18), M(0xf2f2f2), 0, 69, 0);
+  } else if (k === "yasuo") {
+    mesh(body, new THREE.CylinderGeometry(7, 10, 46, 8), E(0x2f5f9a), 0, 23, 0);
+    mesh(body, new THREE.SphereGeometry(8, 12, 10), skin, 0, 52, 0);
+    mesh(body, new THREE.BoxGeometry(5, 5, 20), M(0x151515), 0, 56, -12);
+    mesh(body, new THREE.BoxGeometry(22, 4, 10), M(0xd24545), 0, 42, 4);
+    const s = mesh(body, new THREE.BoxGeometry(3, 54, 3), M(0xdfe9f2, 0x88ccff, 0.5), 16, 32, 6); s.rotation.z = -0.35;
+  } else if (k === "teemo") {
+    const b = mesh(body, new THREE.SphereGeometry(11, 12, 10), E(0x8a6233), 0, 13, 0); b.scale.y = 1.1;
+    mesh(body, new THREE.SphereGeometry(11, 12, 10), M(0xd9b27a), 0, 31, 0);
+    mesh(body, new THREE.ConeGeometry(13, 18, 10), E(0xb23ca0), 0, 47, 0);
+    for (const s of [-1, 1]) { mesh(body, new THREE.SphereGeometry(2.4, 6, 6), M(0xffffff), s * 5, 33, 9); mesh(body, new THREE.SphereGeometry(4, 6, 6), M(0xd9b27a), s * 13, 36, 0); }
+  } else {
+    mesh(body, new THREE.CylinderGeometry(8, 13, 42, 8), E(0xe0b030), 0, 21, 0);
+    mesh(body, new THREE.SphereGeometry(9, 12, 10), skin, 0, 49, 0);
+    mesh(body, new THREE.ConeGeometry(8, 11, 5), M(0xffe066, 0xffc800, 0.8), 0, 62, 0);
+    const st = mesh(body, new THREE.OctahedronGeometry(4.5), M(0xffffff, 0xffffff, 1), 0, 78, 0); g.userData.star = st;
+  }
+  const sh = mesh(g, new THREE.SphereGeometry(30, 14, 10), B(0xffffff, 0.22), 0, 32, 0); sh.visible = false;
+  const st = mesh(g, new THREE.TorusGeometry(15, 1.8, 6, 18), B(0xffe14a), 0, 86, 0); st.rotation.x = Math.PI / 2; st.visible = false;
+  g.userData.body = body; g.userData.sh = sh; g.userData.st = st; g.userData.key = k + team;
+  return g;
+}
+const champs = new Map(), minionPool = [], shotPool = [], wallPool = [], relicObjs = [];
+const shotGeo = new THREE.SphereGeometry(7, 8, 8), wallGeo = new THREE.CylinderGeometry(1, 1, 70, 24, 1, true), fxRing = new THREE.RingGeometry(0.86, 1, 48);
+RELICS.forEach(([x, z]) => {
+  const m = mesh(scene, new THREE.OctahedronGeometry(11), M(0x2fd16b, 0x2fd16b, 1), x, 22, z);
+  relicObjs.push(m);
+});
+function pooled(pool, n, make) { while (pool.length < n) { const o = make(); scene.add(o); pool.push(o); } pool.forEach((o, i) => { o.visible = i < n; }); }
+
+// ================= 입력 =================
+const toScreen = (x, y, z) => { const v = new THREE.Vector3(x, y, z).project(camera); return v.z > 1 ? null : { x: (v.x * .5 + .5) * cv.width, y: (-v.y * .5 + .5) * cv.height }; };
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), gplane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), hit = new THREE.Vector3();
+function ground(cx, cy) {
+  ndc.set(cx / innerWidth * 2 - 1, -(cy / innerHeight) * 2 + 1); ray.setFromCamera(ndc, camera);
+  return ray.ray.intersectPlane(gplane, hit) ? { x: hit.x, y: hit.z } : null;
+}
 const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
 
 cv.addEventListener("contextmenu", (e) => e.preventDefault());
 cv.addEventListener("pointerdown", (e) => {
-  const sx = e.clientX * dpr, sy = e.clientY * dpr;
+  const sx = e.clientX * dpr, sy = e.clientY * dpr; lastPtr = { x: e.clientX, y: e.clientY };
   if (sx > mini.x && sx < mini.x + mini.w && sy > mini.y && sy < mini.y + mini.h) {
     send({ t: "mv", x: (sx - mini.x) / mini.w * W, y: (sy - mini.y) / mini.h * H }); return;
   }
-  const p = toWorld(e); mouse = p;
+  camera.updateMatrixWorld(); const p = ground(e.clientX, e.clientY); if (!p) return; mouse = p;
   if (e.button === 2 || e.pointerType === "touch") send({ t: "mv", x: p.x, y: p.y });
   else if (e.button === 0) send({ t: "q", x: p.x, y: p.y });
 });
-cv.addEventListener("pointermove", (e) => { mouse = toWorld(e); });
+cv.addEventListener("pointermove", (e) => { lastPtr = { x: e.clientX, y: e.clientY }; });
 
 const keys = new Set(); let lastDir = "0,0";
 const SLOT = { q: "q", e: "w", " ": "e", r: "r" };
-function sendDir() {
-  const x = (keys.has("d") ? 1 : 0) - (keys.has("a") ? 1 : 0), y = (keys.has("s") ? 1 : 0) - (keys.has("w") ? 1 : 0);
-  const s = x + "," + y;
-  if (s !== lastDir) { lastDir = s; send({ t: "dir", x, y }); }
+function sendDir() {   // 카메라가 비스듬해서, 화면 기준 WASD를 월드 방향으로 변환
+  const f = (keys.has("w") ? 1 : 0) - (keys.has("s") ? 1 : 0), r = (keys.has("d") ? 1 : 0) - (keys.has("a") ? 1 : 0);
+  const x = +(-Math.sin(YAW) * f + Math.cos(YAW) * r).toFixed(2), y = +(-Math.cos(YAW) * f - Math.sin(YAW) * r).toFixed(2);
+  const s = x + "," + y; if (s !== lastDir) { lastDir = s; send({ t: "dir", x, y }); }
 }
 addEventListener("keydown", (e) => {
   if (!ws || cin.hidden) return;
@@ -126,7 +285,7 @@ addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !typing) { cin.focus(); keys.clear(); sendDir(); e.preventDefault(); return; }
   if (typing || document.activeElement === lch) return;
   const k = e.key.toLowerCase();
-  if ("wasd".includes(k) && k.length === 1) { keys.add(k); sendDir(); e.preventDefault(); return; }
+  if (k.length === 1 && "wasd".includes(k)) { keys.add(k); sendDir(); e.preventDefault(); return; }
   if (SLOT[k]) { send({ t: SLOT[k], x: mouse.x, y: mouse.y }); e.preventDefault(); }
 });
 addEventListener("keyup", (e) => { if (e.key === " " && document.activeElement !== cin) e.preventDefault(); keys.delete(e.key.toLowerCase()); sendDir(); });
@@ -135,10 +294,7 @@ cin.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { const v = cin.value.trim(); if (v) send({ t: "chat", m: v }); cin.value = ""; cin.blur(); }
   if (e.key === "Escape") cin.blur();
 });
-bq.onclick = () => send({ t: "q", x: mouse.x, y: mouse.y });
-bw.onclick = () => send({ t: "w", x: mouse.x, y: mouse.y });
-be.onclick = () => send({ t: "e", x: mouse.x, y: mouse.y });
-br.onclick = () => send({ t: "r", x: mouse.x, y: mouse.y });
+for (const [b, k] of [[bq, "q"], [bw, "w"], [be, "e"], [br, "r"]]) b.onclick = () => send({ t: k, x: mouse.x, y: mouse.y });
 lch.onchange = () => send({ t: "pick", ch: lch.value });
 lswap.onclick = () => send({ t: "team" });
 lstart.onclick = () => send({ t: "start" });
@@ -146,15 +302,12 @@ lstart.onclick = () => send({ t: "start" });
 function addChat(m) {
   const d = document.createElement("div"), n = document.createElement("b");
   n.style.color = COL[m.team]; n.textContent = m.n + ": ";
-  d.append(n, document.createTextNode(m.m));
-  clog.append(d);
+  d.append(n, document.createTextNode(m.m)); clog.append(d);
   while (clog.children.length > 8) clog.firstChild.remove();
   setTimeout(() => d.remove(), 15000);
 }
-
 function updateLobby(m) {
-  const sig = JSON.stringify([m.p, m.host]);
-  if (sig === lsig) return; lsig = sig;
+  const sig = JSON.stringify([m.p, m.host]); if (sig === lsig) return; lsig = sig;
   lb.textContent = lr.textContent = "";
   for (const p of m.p) {
     const li = document.createElement("li");
@@ -165,7 +318,6 @@ function updateLobby(m) {
   if (mine && document.activeElement !== lch) lch.value = mine[3];
   lstart.hidden = me.id !== m.host; lwait.hidden = me.id === m.host;
 }
-
 f.onsubmit = (e) => {
   e.preventDefault();
   ws = new WebSocket(WS_URL + "?room=" + encodeURIComponent(room.value.trim()));
@@ -180,140 +332,120 @@ f.onsubmit = (e) => {
       lobby.hidden = !lobbyNow; skills.hidden = lobbyNow;
       if (lobbyNow) { updateLobby(m); msg.textContent = ""; return; }
       const now = performance.now();
-      for (const x of m.fx) fxs.push({ x: x[0], y: x[1], r: x[2], team: x[3], t: now });
+      for (const x of m.fx) {
+        const r = new THREE.Mesh(fxRing, B(TC[x[3]], 0.7)); r.rotation.x = -Math.PI / 2; r.position.set(x[0], 3, x[1]); r.scale.setScalar(x[2]);
+        scene.add(r); fxs.push({ mesh: r, t: now });
+      }
     }
   };
   ws.onclose = () => { snap = null; join.hidden = false; lobby.hidden = true; skills.hidden = true; cin.hidden = true; msg.textContent = ""; };
   ws.onerror = () => alert("서버에 연결할 수 없습니다. WS_URL 주소와 학교 네트워크를 확인하세요.");
 };
 
-function circle(x, y, r, fill, stroke, lw = 3) {
+// ================= 렌더 루프 =================
+function sbar(p, w, v, max, color) {
+  if (!p) return; const ww = w * dpr;
+  ctx.fillStyle = "#000b"; ctx.fillRect(p.x - ww / 2, p.y, ww, 5 * dpr);
+  ctx.fillStyle = color; ctx.fillRect(p.x - ww / 2, p.y, ww * Math.max(0, v / max), 5 * dpr);
+}
+function circle2(x, y, r, fill, stroke, lw = 3) {
   ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
   if (fill) { ctx.fillStyle = fill; ctx.fill(); }
   if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
 }
-function bar(x, y, w, v, max, color) {
-  ctx.fillStyle = "#000a"; ctx.fillRect(x - w/2, y, w, 6);
-  ctx.fillStyle = color; ctx.fillRect(x - w/2, y, w * Math.max(0, v / max), 6);
-}
+const tmpV = new THREE.Vector3();
 
-// 칼바람 나락 스타일 맵: 어둠 속 얼음 다리, 룬 난간, 팀 샘터, 치유 유물
-function drawMap(tm) {
-  const g = ctx.createLinearGradient(0, -200, 0, H + 200);
-  g.addColorStop(0, "#050b13"); g.addColorStop(.5, "#0d2233"); g.addColorStop(1, "#050b13");
-  ctx.fillStyle = g; ctx.fillRect(-50, -300, W + 100, H + 600);
-  // 얼음 절벽 가장자리
-  ctx.fillStyle = "#b9dbe8";
-  for (const [y0, dir] of [[50, -1], [H - 50, 1]]) {
-    ctx.beginPath(); ctx.moveTo(0, y0);
-    for (let x = 0; x <= W; x += 40) ctx.lineTo(x, y0 + dir * (10 + ((x * 7) % 5) * 5));
-    ctx.lineTo(W, y0); ctx.fill();
-  }
-  // 다리 바닥
-  const b = ctx.createLinearGradient(0, 50, 0, H - 50);
-  b.addColorStop(0, "#9ec0d0"); b.addColorStop(.5, "#7fa5b8"); b.addColorStop(1, "#9ec0d0");
-  ctx.fillStyle = b; ctx.fillRect(0, 50, W, H - 100);
-  ctx.strokeStyle = "#ffffff30"; ctx.lineWidth = 2;
-  for (let x = 0; x < W; x += 80) { ctx.beginPath(); ctx.moveTo(x, 50); ctx.lineTo(x, H - 50); ctx.stroke(); }
-  for (let y = 120; y < H - 50; y += 70) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-  ctx.fillStyle = "#ffffff1c";
-  for (let i = 0; i < 26; i++) { ctx.beginPath(); ctx.ellipse((i * 191) % W, 90 + (i * 53) % 320, 38, 12, 0, 0, 7); ctx.fill(); }
-  // 팀 샘터
-  for (const [x, t] of [[90, "b"], [W - 90, "r"]]) {
-    ctx.fillStyle = COL[t] + "26"; ctx.fillRect(t === "b" ? 0 : W - 260, 50, 260, H - 100);
-    circle(x, H/2, 150, COL[t] + "1f", COL[t] + "88", 3);
-    circle(x, H/2, 100, null, COL[t] + "55", 2);
-  }
-  circle(W/2, H/2, 70, null, "#ffffff44", 3); circle(W/2, H/2, 40, "#ffffff14", "#ffffff44", 2);
-  // 난간 + 룬 불빛
-  ctx.strokeStyle = "#e9f6fb"; ctx.lineWidth = 6; ctx.strokeRect(0, 50, W, H - 100);
-  for (let x = 50; x < W; x += 100) {
-    const a = 0.5 + 0.5 * Math.sin(tm / 600 + x);
-    circle(x, 50, 5, `rgba(120,230,255,${a})`); circle(x, H - 50, 5, `rgba(120,230,255,${a})`);
-  }
-  // 눈보라
-  ctx.fillStyle = "#ffffff88";
-  for (const [x, y, s] of SNOW) ctx.fillRect((x + tm * 0.02 * s) % W, y + Math.sin(tm / 900 + x) * 6, s, s);
-}
-
-function drawTower(x, team, hp, near) {
-  const y = H / 2, c = COL[team];
-  if (near) circle(x, y, 270, null, c + "55", 2);
-  ctx.fillStyle = "#1c2a35"; ctx.beginPath(); ctx.ellipse(x, y + 24, 32, 12, 0, 0, 7); ctx.fill();
-  ctx.fillStyle = "#566f80"; ctx.fillRect(x - 14, y - 22, 28, 46);
-  ctx.fillStyle = "#6f8b9c"; ctx.fillRect(x - 18, y - 28, 36, 10);
-  ctx.save(); ctx.shadowColor = c; ctx.shadowBlur = 18; ctx.fillStyle = c;
-  ctx.beginPath(); ctx.moveTo(x, y - 58); ctx.lineTo(x + 10, y - 38); ctx.lineTo(x, y - 28); ctx.lineTo(x - 10, y - 38); ctx.fill(); ctx.restore();
-  bar(x, y - 70, 56, hp, 800, "#7fe08a");
-}
-function drawNexus(x, team, hp) {
-  const y = H / 2, c = COL[team];
-  circle(x, y + 30, 54, "#1c2a35");
-  ctx.save(); ctx.shadowColor = c; ctx.shadowBlur = 28; ctx.fillStyle = c;
-  ctx.beginPath(); ctx.moveTo(x, y - 50); ctx.lineTo(x + 34, y); ctx.lineTo(x, y + 44); ctx.lineTo(x - 34, y); ctx.fill(); ctx.restore();
-  ctx.fillStyle = "#ffffff55"; ctx.beginPath(); ctx.moveTo(x, y - 50); ctx.lineTo(x + 12, y); ctx.lineTo(x, y + 44); ctx.lineTo(x - 12, y); ctx.fill();
-  bar(x, y - 66, 110, hp, 1500, c);
-}
-
-function draw() {
-  requestAnimationFrame(draw);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = "#050b13"; ctx.fillRect(0, 0, cv.width, cv.height);
-  if (!snap || snap.ph === "lobby") return;
+function frame() {
+  requestAnimationFrame(frame);
   const tm = performance.now();
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  // 눈 / 수정 회전
+  const sp = snow.geometry.attributes.position;
+  for (let i = 0; i < SN; i++) { let y = sp.getY(i) - 0.6; if (y < 0) y = 520; sp.setY(i, y); sp.setX(i, sp.getX(i) + Math.sin(tm / 1500 + i) * 0.15); }
+  sp.needsUpdate = true;
+  for (const t in nexusObjs) nexusObjs[t].cr.rotation.y = tm / 1200;
+  relicObjs.forEach((m) => { m.rotation.y = tm / 500; m.position.y = 22 + Math.sin(tm / 400) * 4; });
+
+  if (!snap || snap.ph === "lobby") {    // 대기실 배경: 느리게 도는 카메라
+    camT.set(W / 2 + Math.sin(tm / 6000) * 500, 0, H / 2);
+    camera.position.set(camT.x + Math.sin(YAW) * CAM_D, CAM_H, camT.z + Math.cos(YAW) * CAM_D); camera.lookAt(camT);
+    snow.position.set(camT.x, 0, camT.z); R3.render(scene, camera); return;
+  }
 
   for (const p of snap.p) {
     let d = disp.get(p[0]);
-    if (!d) { d = { x: p[3], y: p[4] }; disp.set(p[0], d); }
-    d.x += (p[3] - d.x) * 0.35; d.y += (p[4] - d.y) * 0.35;
+    if (!d) { d = { x: p[3], y: p[4], ang: 0 }; disp.set(p[0], d); }
+    const ox = d.x, oy = d.y; d.x += (p[3] - d.x) * 0.35; d.y += (p[4] - d.y) * 0.35;
+    d.mv = Math.hypot(d.x - ox, d.y - oy) > 0.3; if (d.mv) d.ang = Math.atan2(d.x - ox, d.y - oy);
   }
-  const my = disp.get(me.id) || { x: W/2, y: H/2 };
-  const vh = cv.height / scale;
-  cam.x = clamp(my.x - VW/2, 0, W - VW);
-  cam.y = H/2 - vh/2;
-  ctx.setTransform(scale, 0, 0, scale, -cam.x * scale, -cam.y * scale);
+  const my = disp.get(me.id) || { x: W / 2, y: H / 2 };
+  camT.x += (clamp(my.x, 0, W) - camT.x) * 0.15; camT.z += (my.y - camT.z) * 0.15;
+  camera.position.set(camT.x + Math.sin(YAW) * CAM_D, CAM_H, camT.z + Math.cos(YAW) * CAM_D); camera.lookAt(camT);
+  camera.updateMatrixWorld(); snow.position.set(camT.x, 0, camT.z);
+  const gp = ground(lastPtr.x, lastPtr.y); if (gp) mouse = gp;
 
-  drawMap(tm);
-  drawNexus(90, "b", snap.n[0]); drawNexus(W - 90, "r", snap.n[1]);
-  for (const T of snap.tw) if (T[2] > 0) {
-    drawTower(T[1], T[0], T[2], Math.abs(my.x - T[1]) < 380);
-    if (T[3]) { ctx.strokeStyle = "#ffe27a"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(T[1], H/2 - 38); ctx.lineTo(T[3], T[4]); ctx.stroke(); }
-  }
-  RELICS.forEach((r, i) => {
-    if (!snap.rl[i]) return;
-    ctx.save(); ctx.shadowColor = "#6dff9a"; ctx.shadowBlur = 14; circle(r[0], r[1], 11, "#2fd16b", "#d8ffe5", 2); ctx.restore();
-    ctx.fillStyle = "#fff"; ctx.fillRect(r[0] - 5, r[1] - 1.5, 10, 3); ctx.fillRect(r[0] - 1.5, r[1] - 5, 3, 10);
-  });
-  for (const w of snap.wl) { ctx.globalAlpha = .5; circle(w[0], w[1], w[2], "#9fe3ff"); ctx.globalAlpha = 1; }
-  fxs = fxs.filter((x) => tm - x.t < 350);
-  for (const x of fxs) { ctx.globalAlpha = 1 - (tm - x.t) / 350; circle(x.x, x.y, x.r, COL[x.team] + "55", "#fff", 2); ctx.globalAlpha = 1; }
-  for (const m of snap.m) { circle(m[1], m[2], 12, COL[m[0]] + "cc", "#0006", 2); bar(m[1], m[2] - 22, 26, m[3], 120, "#7fe08a"); }
-  for (const s of snap.s) circle(s[0], s[1], 8, "#fff", COL[s[2]]);
+  // 챔피언
+  const alive = new Set();
   for (const p of snap.p) {
-    const [id, team, nm, , , hp, max, dead, , , , , chk, sh] = p, d = disp.get(id);
-    ctx.globalAlpha = dead ? 0.25 : 1;
-    circle(d.x, d.y, 20, COL[team], id === me.id ? "#fff" : "#0008");
-    if (sh > 0) circle(d.x, d.y, 25, null, "#fff9", 2);
-    if (p[19]) circle(d.x, d.y, 29, null, "#ffe14a", 3);
-    ctx.fillStyle = "#fff"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
-    ctx.fillText((NAMES[chk] || "?")[0], d.x, d.y + 6);
-    ctx.globalAlpha = 1;
-    if (!dead) { bar(d.x, d.y - 36, 50, hp, max, "#7fe08a"); ctx.font = "bold 13px sans-serif"; ctx.fillText(`Lv${p[16]} ${nm} (${NAMES[chk]})`, d.x, d.y - 42); }
+    const [id, team, , , , , , dead, , , , , chk, sh] = p, d = disp.get(id); alive.add(id);
+    let c = champs.get(id);
+    if (!c || c.userData.key !== chk + team) { if (c) scene.remove(c); c = makeChamp(chk, team); scene.add(c); champs.set(id, c); }
+    c.visible = !dead; c.position.set(d.x, 0, d.y); c.rotation.y = d.ang;
+    c.userData.body.position.y = d.mv ? Math.abs(Math.sin(tm / 110)) * 4 : 0;
+    if (c.userData.orbs) c.userData.orbs.rotation.y = tm / 400;
+    if (c.userData.star) { c.userData.star.rotation.y = tm / 300; c.userData.star.position.y = 78 + Math.sin(tm / 300) * 3; }
+    c.userData.sh.visible = sh > 0; c.userData.st.visible = !!p[19]; c.userData.st.rotation.z = tm / 200;
+  }
+  for (const [id, c] of champs) if (!alive.has(id)) { scene.remove(c); champs.delete(id); }
+  // 미니언
+  pooled(minionPool, snap.m.length, () => new THREE.Group());
+  snap.m.forEach((m, i) => {
+    let o = minionPool[i];
+    if (o.userData.team !== m[0]) { const n = makeMinion(m[0]); scene.add(n); scene.remove(o); minionPool[i] = n; o = n; }
+    o.visible = true; o.position.set(m[1], Math.abs(Math.sin(tm / 160 + i)) * 2, m[2]); o.rotation.y = m[0] === "b" ? Math.PI / 2 : -Math.PI / 2;
+  });
+  // 투사체 / 장막
+  pooled(shotPool, snap.s.length, () => new THREE.Mesh(shotGeo, B(0xffffff)));
+  snap.s.forEach((s, i) => { shotPool[i].position.set(s[0], 30, s[1]); shotPool[i].material.color.setHex(s[2] === "b" ? 0xbfe3ff : 0xffc1c8); });
+  pooled(wallPool, snap.wl.length, () => new THREE.Mesh(wallGeo, B(0x9fe3ff, 0.35)));
+  snap.wl.forEach((w, i) => { wallPool[i].position.set(w[0], 35, w[1]); wallPool[i].scale.set(w[2], 1, w[2]); });
+  // 타워
+  snap.tw.forEach((T, i) => {
+    let o = towerObjs[i]; if (!o) o = towerObjs[i] = makeTower(T[0]);
+    o.g.visible = T[2] > 0; o.g.position.set(T[1], 0, H / 2); o.cr.rotation.y = tm / 700;
+    o.range.visible = T[2] > 0 && Math.abs(my.x - T[1]) < 420;
+    o.beam.visible = !!T[3];
+    if (T[3]) { const a = o.beam.geometry.attributes.position; a.setXYZ(0, T[1], 138, H / 2); a.setXYZ(1, T[3], 30, T[4]); a.needsUpdate = true; }
+  });
+  nexusObjs.b.g.visible = snap.n[0] > 0; nexusObjs.r.g.visible = snap.n[1] > 0;
+  relicObjs.forEach((m, i) => { m.visible = !!snap.rl[i]; });
+  // 효과 링
+  fxs = fxs.filter((x) => { const a = (tm - x.t) / 350; if (a >= 1) { scene.remove(x.mesh); x.mesh.material.dispose(); return false; } x.mesh.material.opacity = 0.7 * (1 - a); return true; });
+
+  R3.render(scene, camera);
+
+  // ---- 머리 위 체력바/이름 (2D 오버레이) ----
+  for (const T of snap.tw) if (T[2] > 0) sbar(toScreen(T[1], 160, H / 2), 60, T[2], 800, "#7fe08a");
+  sbar(toScreen(90, 150, H / 2), 110, snap.n[0], 1500, COL.b); sbar(toScreen(W - 90, 150, H / 2), 110, snap.n[1], 1500, COL.r);
+  for (const m of snap.m) sbar(toScreen(m[1], 48, m[2]), 26, m[3], 120, "#7fe08a");
+  ctx.textAlign = "center"; ctx.font = `bold ${13 * dpr}px sans-serif`;
+  for (const p of snap.p) {
+    if (p[7]) continue; const d = disp.get(p[0]), s = toScreen(d.x, 82, d.y); if (!s) continue;
+    sbar(s, 58, p[5], p[6], "#7fe08a");
+    ctx.fillStyle = COL[p[1]]; ctx.fillText(`Lv${p[16]} ${p[2]} (${NAMES[p[12]]})`, s.x, s.y - 4 * dpr);
   }
 
   // ---- 화면 고정 UI ----
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = "#050b13dd"; ctx.fillRect(mini.x, mini.y, mini.w, mini.h);
   ctx.strokeStyle = "#cfe9f5"; ctx.lineWidth = 2; ctx.strokeRect(mini.x, mini.y, mini.w, mini.h);
   const mx = (x) => mini.x + x / W * mini.w, my2 = (y) => mini.y + y / H * mini.h, u = mini.w / 300;
-  ctx.fillStyle = "#7fa5b8"; ctx.fillRect(mx(0), my2(50), mini.w, mini.h * 0.8);
+  ctx.fillStyle = "#3f6c87"; ctx.fillRect(mx(0), my2(50), mini.w, mini.h * 0.8);
   for (const T of snap.tw) if (T[2] > 0) { ctx.fillStyle = COL[T[0]]; ctx.fillRect(mx(T[1]) - 3*u, my2(H/2) - 3*u, 6*u, 6*u); }
-  circle(mx(90), my2(H/2), 5*u, COL.b); circle(mx(W - 90), my2(H/2), 5*u, COL.r);
-  for (const m of snap.m) circle(mx(m[1]), my2(m[2]), 1.5*u, COL[m[0]]);
-  for (const p of snap.p) if (!p[7]) { const d = disp.get(p[0]); circle(mx(d.x), my2(d.y), 3.5*u, COL[p[1]], p[0] === me.id ? "#fff" : null, 1.5*u); }
-  ctx.strokeStyle = "#fff"; ctx.lineWidth = 1; ctx.strokeRect(mx(cam.x), my2(cam.y), VW / W * mini.w, Math.min(mini.h, vh / H * mini.h));
+  circle2(mx(90), my2(H/2), 5*u, COL.b); circle2(mx(W - 90), my2(H/2), 5*u, COL.r);
+  for (const m of snap.m) circle2(mx(m[1]), my2(m[2]), 1.5*u, COL[m[0]]);
+  for (const p of snap.p) if (!p[7]) { const d = disp.get(p[0]); circle2(mx(d.x), my2(d.y), 3.5*u, COL[p[1]], p[0] === me.id ? "#fff" : null, 1.5*u); }
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 1; ctx.strokeRect(mx(camT.x - 380), my2(camT.z - 200), 760 / W * mini.w, 400 / H * mini.h);
 
-  // 상단: 킬 스코어 + 시간
   const kb = snap.p.filter((p) => p[1] === "b").reduce((a, p) => a + p[8], 0), kr = snap.p.filter((p) => p[1] === "r").reduce((a, p) => a + p[8], 0);
   const mm = String(Math.floor(snap.tm / 60)).padStart(2, "0"), ss = String(snap.tm % 60).padStart(2, "0");
   ctx.textAlign = "center"; ctx.font = `bold ${20 * dpr}px sans-serif`;
@@ -346,7 +478,7 @@ function draw() {
   }
   if (snap.win) msg.innerHTML = (snap.win === "b" ? "블루팀" : "레드팀") + " 승리!<br><small style='font-size:18px'>곧 대기실로 돌아갑니다</small>";
 }
-draw();
+frame();
 </script>
 </body>
 </html>
