@@ -33,7 +33,7 @@ export default {
 };
 
 export class Room {
-  constructor() { this.socks = new Map(); this.nid = 1; this.timer = null; this.reset(); }
+  constructor() { this.socks = new Map(); this.nid = 1; this.timer = null; this.phase = "lobby"; this.host = 0; this.tk = 0; this.reset(); }
 
   reset() {
     this.towers = [];
@@ -43,6 +43,7 @@ export class Room {
     });
     this.nex = { b: { nx: "b", x: 90, y: H / 2, hp: 1500 }, r: { nx: "r", x: W - 90, y: H / 2, hp: 1500 } };
     this.shots = []; this.walls = []; this.minions = []; this.fx = [];
+    this.relics = [[680, 130], [680, 370], [1320, 130], [1320, 370]].map(([x, y]) => ({ x, y, cd: 0 }));
     this.t = 0; this.over = 0; this.win = "";
     for (const p of this.socks.values()) { p.k = 0; p.d = 0; this.spawn(p); }
   }
@@ -73,7 +74,25 @@ export class Room {
           p.name = String(m.n || "").slice(0, 10) || p.name;
           if (CH[m.ch]) p.ch = m.ch;
           this.spawn(p);
+          if (!this.host || !this.socks.has(this.host)) this.host = id;
           server.send(JSON.stringify({ t: "hi", id, team: p.team, ch: p.ch, cdq: CH[p.ch].q.cd, cdw: CH[p.ch].w.cd }));
+          return;
+        }
+        if (m.t === "chat") {
+          const now = Date.now();
+          if (now - (p.lc || 0) < 500) return;
+          p.lc = now;
+          const s = String(m.m || "").slice(0, 100).trim();
+          if (s) this.bcast({ t: "chat", n: p.name, team: p.team, m: s });
+          return;
+        }
+        if (this.phase === "lobby") {
+          if (m.t === "pick" && CH[m.ch]) {
+            p.ch = m.ch; this.spawn(p);
+            server.send(JSON.stringify({ t: "hi", id, team: p.team, ch: p.ch, cdq: CH[p.ch].q.cd, cdw: CH[p.ch].w.cd }));
+          }
+          if (m.t === "team") p.team = p.team === "b" ? "r" : "b";
+          if (m.t === "start" && this.host === id) { this.phase = "play"; this.reset(); }
           return;
         }
         if (p.dead > 0 || this.over) return;
@@ -83,13 +102,16 @@ export class Room {
     });
     const bye = () => {
       this.socks.delete(id);
-      if (!this.socks.size) { clearInterval(this.timer); this.timer = null; this.reset(); }
+      if (this.host === id) this.host = [...this.socks.keys()][0] || 0;
+      if (!this.socks.size) { clearInterval(this.timer); this.timer = null; this.phase = "lobby"; this.reset(); }
     };
     server.addEventListener("close", bye);
     server.addEventListener("error", bye);
     if (!this.timer) this.timer = setInterval(() => this.tick(), DT * 1000);
     return new Response(null, { status: 101, webSocket: client });
   }
+
+  bcast(o) { const s = JSON.stringify(o); for (const q of this.socks.values()) { try { q.ws.send(s); } catch {} } }
 
   cast(p, k, x, y) {
     const s = CH[p.ch][k], cd = "cd" + k;
@@ -136,9 +158,13 @@ export class Room {
   }
 
   tick() {
+    if (this.phase === "lobby") {
+      if (++this.tk % 4 === 0) this.bcast({ t: "s", ph: "lobby", host: this.host, p: [...this.socks.values()].map((p) => [p.id, p.team, p.name, p.ch]) });
+      return;
+    }
     if (this.over) {
       this.over -= DT;
-      if (this.over <= 0) this.reset();
+      if (this.over <= 0) { this.phase = "lobby"; this.reset(); }
     } else {
       this.t += DT;
       if (this.t % 20 < DT) {
@@ -153,6 +179,7 @@ export class Room {
         p.haste = Math.max(0, p.haste - DT);
         if (p.shT > 0) { p.shT -= DT; if (p.shT <= 0) p.sh = 0; }
         if (p.dead > 0) { p.dead -= DT; if (p.dead <= 0) this.spawn(p); continue; }
+        if (p.team === "b" ? p.x < 260 : p.x > W - 260) p.hp = Math.min(p.max, p.hp + 40 * DT);
         const d = dist(p.x, p.y, p.tx, p.ty), step = c.spd * (p.haste > 0 ? 1.6 : 1) * DT;
         if (d <= step) { p.x = p.tx; p.y = p.ty; } else { p.x += ((p.tx - p.x) / d) * step; p.y += ((p.ty - p.y) / d) * step; }
         if (p.atk <= 0) {
@@ -162,6 +189,13 @@ export class Room {
             if (dd < c.ar && dd < bd) { best = t; bd = dd; }
           }
           if (best) { this.hurt(best.o, c.ad, p); p.atk = 0.8; }
+        }
+      }
+      for (const q of this.relics) {
+        q.cd = Math.max(0, q.cd - DT);
+        if (q.cd > 0) continue;
+        for (const p of this.socks.values()) {
+          if (p.dead <= 0 && p.hp < p.max && dist(p.x, p.y, q.x, q.y) < 36) { p.hp = Math.min(p.max, p.hp + 150); q.cd = 30; break; }
         }
       }
       for (const T of this.towers) {
@@ -217,7 +251,8 @@ export class Room {
       wl: this.walls.map((w) => [r(w.x), r(w.y), w.rad, w.team]),
       fx: this.fx,
       n: [this.nex.b.hp, this.nex.r.hp],
-      win: this.win,
+      win: this.win, ph: "play", host: this.host, tm: Math.round(this.t),
+      rl: this.relics.map((q) => (q.cd <= 0 ? 1 : 0)),
     });
     this.fx = [];
     for (const p of this.socks.values()) { try { p.ws.send(msg); } catch {} }
