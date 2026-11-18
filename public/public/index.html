@@ -37,8 +37,8 @@
 <body>
 <canvas id="c"></canvas>
 <div id="msg"></div>
-<div id="hint">우클릭/탭: 이동 · Q / W: 스킬 · Enter: 채팅 · 미니맵 클릭: 이동</div>
-<div id="skills" hidden><button id="bq">Q<i></i></button><button id="bw">W<i></i></button></div>
+<div id="hint">WASD 이동 · Q / E / Space / R 스킬(R은 Lv3부터) · 좌클릭=Q · 우클릭 이동 · Enter 채팅</div>
+<div id="skills" hidden><button id="bq">Q<i></i></button><button id="bw">E<i></i></button><button id="be">␣<i></i></button><button id="br">R<i></i></button></div>
 
 <div id="chat"><div id="clog"></div><input id="cin" maxlength="100" placeholder="Enter 키로 채팅" autocomplete="off" hidden></div>
 
@@ -73,7 +73,7 @@ const WS_URL = "wss://lol.ypec.site/ws";   // ← 서버 주소 (wss:// … /ws)
 
 const W = 2000, H = 500;
 const NAMES = { xerath:"제라스", sett:"세트", yasuo:"야스오", teemo:"티모", seungwoo:"승우이" };
-const DESC = { xerath:"장거리 관통 Q, 범위 폭발 W", sett:"주변 강타 Q, 보호막 W", yasuo:"관통 Q, 바람 장막 W", teemo:"다트 Q, 이속 증가 W", seungwoo:"3갈래 Q, 회복 W" };
+const DESC = { xerath:"장거리 마법사 · 기절 스킬 + 궁극기 폭격", sett:"탱커 · 보호막, 광역 기절, 점프 궁극기", yasuo:"검객 · 돌진, 바람 장막, 광역 궁극기", teemo:"원거리 · 둔화 다트, 이속, 폭발 버섯", seungwoo:"하이브리드 · 3갈래/9갈래 발사, 회복, 돌진" };
 const COL = { b:"#4aa3ff", r:"#ff5a6a" };
 const RELICS = [[680,130],[680,370],[1320,130],[1320,370]];
 const SNOW = [...Array(110)].map((_, i) => [(i * 977) % W, (i * 613) % (H + 200) - 100, 1 + (i % 3)]);
@@ -109,23 +109,36 @@ cv.addEventListener("pointerdown", (e) => {
   }
   const p = toWorld(e); mouse = p;
   if (e.button === 2 || e.pointerType === "touch") send({ t: "mv", x: p.x, y: p.y });
+  else if (e.button === 0) send({ t: "q", x: p.x, y: p.y });
 });
 cv.addEventListener("pointermove", (e) => { mouse = toWorld(e); });
 
+const keys = new Set(); let lastDir = "0,0";
+const SLOT = { q: "q", e: "w", " ": "e", r: "r" };
+function sendDir() {
+  const x = (keys.has("d") ? 1 : 0) - (keys.has("a") ? 1 : 0), y = (keys.has("s") ? 1 : 0) - (keys.has("w") ? 1 : 0);
+  const s = x + "," + y;
+  if (s !== lastDir) { lastDir = s; send({ t: "dir", x, y }); }
+}
 addEventListener("keydown", (e) => {
   if (!ws || cin.hidden) return;
   const typing = document.activeElement === cin;
-  if (e.key === "Enter" && !typing) { cin.focus(); e.preventDefault(); return; }
+  if (e.key === "Enter" && !typing) { cin.focus(); keys.clear(); sendDir(); e.preventDefault(); return; }
   if (typing || document.activeElement === lch) return;
   const k = e.key.toLowerCase();
-  if (k === "q" || k === "w") send({ t: k, x: mouse.x, y: mouse.y });
+  if ("wasd".includes(k) && k.length === 1) { keys.add(k); sendDir(); e.preventDefault(); return; }
+  if (SLOT[k]) { send({ t: SLOT[k], x: mouse.x, y: mouse.y }); e.preventDefault(); }
 });
+addEventListener("keyup", (e) => { if (e.key === " " && document.activeElement !== cin) e.preventDefault(); keys.delete(e.key.toLowerCase()); sendDir(); });
+addEventListener("blur", () => { keys.clear(); sendDir(); });
 cin.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { const v = cin.value.trim(); if (v) send({ t: "chat", m: v }); cin.value = ""; cin.blur(); }
   if (e.key === "Escape") cin.blur();
 });
 bq.onclick = () => send({ t: "q", x: mouse.x, y: mouse.y });
 bw.onclick = () => send({ t: "w", x: mouse.x, y: mouse.y });
+be.onclick = () => send({ t: "e", x: mouse.x, y: mouse.y });
+br.onclick = () => send({ t: "r", x: mouse.x, y: mouse.y });
 lch.onchange = () => send({ t: "pick", ch: lch.value });
 lswap.onclick = () => send({ t: "team" });
 lstart.onclick = () => send({ t: "start" });
@@ -281,10 +294,11 @@ function draw() {
     ctx.globalAlpha = dead ? 0.25 : 1;
     circle(d.x, d.y, 20, COL[team], id === me.id ? "#fff" : "#0008");
     if (sh > 0) circle(d.x, d.y, 25, null, "#fff9", 2);
+    if (p[19]) circle(d.x, d.y, 29, null, "#ffe14a", 3);
     ctx.fillStyle = "#fff"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
     ctx.fillText((NAMES[chk] || "?")[0], d.x, d.y + 6);
     ctx.globalAlpha = 1;
-    if (!dead) { bar(d.x, d.y - 36, 50, hp, max, "#7fe08a"); ctx.font = "bold 13px sans-serif"; ctx.fillText(`${nm} (${NAMES[chk]})`, d.x, d.y - 42); }
+    if (!dead) { bar(d.x, d.y - 36, 50, hp, max, "#7fe08a"); ctx.font = "bold 13px sans-serif"; ctx.fillText(`Lv${p[16]} ${nm} (${NAMES[chk]})`, d.x, d.y - 42); }
   }
 
   // ---- 화면 고정 UI ----
@@ -318,8 +332,16 @@ function draw() {
     ctx.fillStyle = "#3fcf6b"; ctx.fillRect(bx, by, bw_ * Math.max(0, mine[5] / mine[6]), 16 * dpr);
     ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.font = `bold ${12 * dpr}px sans-serif`;
     ctx.fillText(`${NAMES[mine[12]]}  ${mine[5]} / ${mine[6]}`, cv.width/2, by + 12.5 * dpr);
-    bq.lastChild.style.height = Math.min(100, mine[10] / (me.cdq || 1) * 100) + "%";
-    bw.lastChild.style.height = Math.min(100, mine[11] / (me.cdw || 1) * 100) + "%";
+    const LAB = { q: "Q", w: "E", e: "␣", r: "R" };
+    [["q", 10, me.cdq], ["w", 11, me.cdw], ["e", 14, me.cde], ["r", 15, me.cdr]].forEach(([k, i, mxcd]) => {
+      const b = document.getElementById("b" + k), cd = mine[i];
+      b.lastChild.style.height = Math.min(100, cd / (mxcd || 1) * 100) + "%";
+      b.firstChild.textContent = k === "r" && mine[16] < 3 ? "Lv3" : cd > 0 ? Math.ceil(cd) : LAB[k];
+    });
+    const xb = by + 18 * dpr;
+    ctx.fillStyle = "#000b"; ctx.fillRect(bx, xb, bw_, 5 * dpr);
+    ctx.fillStyle = "#b78cff"; ctx.fillRect(bx, xb, bw_ * Math.min(1, mine[17] / mine[18]), 5 * dpr);
+    ctx.fillStyle = "#f2c14e"; ctx.textAlign = "right"; ctx.fillText("Lv " + mine[16], bx - 8 * dpr, by + 13 * dpr);
     if (mine[7]) msg.textContent = "부활 대기 중…"; else if (!snap.win) msg.textContent = "";
   }
   if (snap.win) msg.innerHTML = (snap.win === "b" ? "블루팀" : "레드팀") + " 승리!<br><small style='font-size:18px'>곧 대기실로 돌아갑니다</small>";
