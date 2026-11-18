@@ -1,209 +1,260 @@
-<!doctype html>
-<html lang="ko">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>길음중 칼바람</title>
-<style>
-  :root { --bg:#0b1a24; --panel:#142a36; --ink:#e8f1f5; --gold:#f2c14e; }
-  * { box-sizing: border-box; }
-  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
-    font-family:"Pretendard","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif; overflow:hidden; touch-action:none; }
-  canvas { display:block; width:100vw; height:100vh; }
-  #join { position:fixed; inset:0; display:grid; place-items:center; background:var(--bg); }
-  #join form { width:min(380px,90vw); display:grid; gap:12px; }
-  h1 { margin:0 0 4px; font-size:34px; letter-spacing:-1px; }
-  p.sub { margin:0 0 8px; color:#8fb0c0; line-height:1.5; }
-  input, select, button { font:inherit; padding:12px 14px; border-radius:8px; border:2px solid #2a4756; background:var(--panel); color:var(--ink); }
-  input:focus-visible, select:focus-visible, button:focus-visible { outline:3px solid var(--gold); outline-offset:2px; }
-  button.go { background:var(--gold); color:#1a1405; border-color:var(--gold); font-weight:700; cursor:pointer; }
-  #skills { position:fixed; right:12px; bottom:calc(12px + env(safe-area-inset-bottom,0px)); display:flex; gap:8px; }
-  #skills button { width:64px; height:64px; font-weight:700; font-size:18px; position:relative; overflow:hidden; }
-  #skills i { position:absolute; left:0; bottom:0; width:100%; height:0; background:#000a; }
-  #msg { position:fixed; top:14%; left:0; right:0; text-align:center; font-size:40px; font-weight:800; pointer-events:none; text-shadow:0 2px 12px #000; }
-  #hint { position:fixed; left:12px; top:12px; font-size:13px; color:#8fb0c0; }
-  [hidden] { display:none !important; }
-</style>
-</head>
-<body>
-<canvas id="c"></canvas>
-<div id="msg"></div>
-<div id="hint">우클릭/탭: 이동 · Q / W: 스킬 · 미니맵 클릭: 이동 · 근처 적은 자동 공격</div>
-<div id="skills" hidden>
-  <button id="bq">Q<i></i></button><button id="bw">W<i></i></button>
-</div>
-<div id="join">
-  <form id="f">
-    <h1>길음중 칼바람</h1>
-    <p class="sub">승원이 줴줴이야 동훈이도 줴줴이야</p>
-    <input id="nick" placeholder="닉네임" maxlength="10" required autocomplete="off">
-    <select id="ch" aria-label="챔피언">
-      <option value="random">무작위 (칼바람 스타일)</option>
-      <option value="xerath">제라스 – 장거리 관통 Q, 범위 폭발 W</option>
-      <option value="sett">세트 – 주변 강타 Q, 보호막 W</option>
-      <option value="yasuo">야스오 – 관통 Q, 바람 장막 W</option>
-      <option value="teemo">티모 – 암살 다트 Q, 이속 증가 W</option>
-      <option value="seungwoo">승우이 – 3갈래 Q, 회복 W</option>
-    </select>
-    <input id="room" placeholder="방 코드 (예: 3반)" maxlength="20" value="main" required autocomplete="off">
-    <button class="go">입장</button>
-  </form>
-</div>
-<script>
-// ★ 워커 배포 후 본인 주소로 바꾸세요 (wss:// 로 시작, 끝에 /ws)
-const WS_URL = "wss://lol.ypec.site/ws";
+const W = 2000, H = 500, DT = 0.05;
+const dist = (a, b, c, d) => Math.hypot(a - c, b - d);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, +v || 0));
 
-const W = 2000, H = 500;
-const NAMES = { xerath:"제라스", sett:"세트", yasuo:"야스오", teemo:"티모", seungwoo:"승우이" };
-const COL = { b:"#4aa3ff", r:"#ff5a6a" };
-const cv = document.getElementById("c"), ctx = cv.getContext("2d");
-let ws, me = {}, snap = null, disp = new Map(), fxs = [];
-let dpr = 1, scale = 1, VW = 1000, cam = { x: 0, y: 0 }, mouse = { x: W/2, y: H/2 }, mini = { x:0, y:0, w:0, h:0 };
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+// 챔피언 정의: k=스킬 종류
+const CH = {
+  xerath:   { hp: 420, spd: 210, ar: 260, ad: 22,
+    q: { k: "shot", cd: 4, rng: 1100, spd: 900, dmg: 100, r: 16, pierce: 1 },
+    w: { k: "aoeAt", cd: 6, rng: 700, rad: 100, dmg: 80 } },
+  sett:     { hp: 750, spd: 225, ar: 130, ad: 30,
+    q: { k: "aoeSelf", cd: 4, rad: 140, dmg: 75 },
+    w: { k: "shield", cd: 8, amt: 200, dur: 3 } },
+  yasuo:    { hp: 520, spd: 235, ar: 130, ad: 26,
+    q: { k: "shot", cd: 2, rng: 380, spd: 800, dmg: 65, r: 18, pierce: 1 },
+    w: { k: "wall", cd: 9, dur: 3.5, rad: 110, rng: 200 } },
+  teemo:    { hp: 400, spd: 225, ar: 260, ad: 20,
+    q: { k: "shot", cd: 2.5, rng: 650, spd: 850, dmg: 60, r: 12 },
+    w: { k: "haste", cd: 8, dur: 2.5 } },
+  seungwoo: { hp: 560, spd: 225, ar: 140, ad: 28,
+    q: { k: "fan", cd: 3.5, rng: 450, spd: 700, dmg: 40, r: 12, ang: 0.35 },
+    w: { k: "heal", cd: 8, amt: 160 } },
+};
+const KEYS = Object.keys(CH);
+const TX = [820, 560, 300]; // 바깥 타워부터
 
-function resize() {
-  dpr = devicePixelRatio || 1;
-  cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
-  VW = innerWidth < innerHeight ? 600 : 1000;
-  scale = cv.width / VW;
-  mini.w = Math.min(300 * dpr, cv.width * 0.45); mini.h = mini.w * H / W;
-  mini.x = 12 * dpr; mini.y = cv.height - mini.h - 12 * dpr;
-}
-addEventListener("resize", resize); resize();
-
-const toWorld = (e) => ({ x: e.clientX * dpr / scale + cam.x, y: e.clientY * dpr / scale + cam.y });
-function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
-
-cv.addEventListener("contextmenu", (e) => e.preventDefault());
-cv.addEventListener("pointerdown", (e) => {
-  const sx = e.clientX * dpr, sy = e.clientY * dpr;
-  if (sx > mini.x && sx < mini.x + mini.w && sy > mini.y && sy < mini.y + mini.h) {
-    send({ t: "mv", x: (sx - mini.x) / mini.w * W, y: (sy - mini.y) / mini.h * H }); return;
-  }
-  const p = toWorld(e); mouse = p;
-  if (e.button === 2 || e.pointerType === "touch") send({ t: "mv", x: p.x, y: p.y });
-});
-cv.addEventListener("pointermove", (e) => { mouse = toWorld(e); });
-addEventListener("keydown", (e) => {
-  const k = e.key.toLowerCase();
-  if (k === "q" || k === "w") send({ t: k, x: mouse.x, y: mouse.y });
-});
-bq.onclick = () => send({ t: "q", x: mouse.x, y: mouse.y });
-bw.onclick = () => send({ t: "w", x: mouse.x, y: mouse.y });
-
-f.onsubmit = (e) => {
-  e.preventDefault();
-  ws = new WebSocket(WS_URL + "?room=" + encodeURIComponent(room.value.trim()));
-  ws.onopen = () => {
-    send({ t: "name", n: nick.value.trim(), ch: ch.value });
-    join.hidden = true; skills.hidden = false;
-  };
-  ws.onmessage = (ev) => {
-    const m = JSON.parse(ev.data);
-    if (m.t === "hi") { me = m; bq.firstChild.textContent = "Q"; }
-    if (m.t === "s") {
-      snap = m;
-      const now = performance.now();
-      for (const x of m.fx) fxs.push({ x: x[0], y: x[1], r: x[2], team: x[3], t: now });
-    }
-  };
-  ws.onclose = () => { snap = null; join.hidden = false; skills.hidden = true; msg.textContent = ""; };
-  ws.onerror = () => alert("서버에 연결할 수 없습니다. WS_URL 주소와 학교 네트워크를 확인하세요.");
+export default {
+  fetch(req, env) {
+    const u = new URL(req.url);
+    if (u.pathname !== "/ws") return new Response("minirift server ok");
+    const room = (u.searchParams.get("room") || "main").slice(0, 20);
+    return env.ROOM.get(env.ROOM.idFromName(room)).fetch(req);
+  },
 };
 
-function circle(x, y, r, fill, stroke, lw = 3) {
-  ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
-  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
-  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
-}
-function bar(x, y, w, v, max, color) {
-  ctx.fillStyle = "#000a"; ctx.fillRect(x - w/2, y, w, 6);
-  ctx.fillStyle = color; ctx.fillRect(x - w/2, y, w * Math.max(0, v / max), 6);
-}
+export class Room {
+  constructor() { this.socks = new Map(); this.nid = 1; this.timer = null; this.phase = "lobby"; this.host = 0; this.tk = 0; this.reset(); }
 
-function draw() {
-  requestAnimationFrame(draw);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = "#07111a"; ctx.fillRect(0, 0, cv.width, cv.height);
-  if (!snap) return;
-
-  for (const p of snap.p) {
-    let d = disp.get(p[0]);
-    if (!d) { d = { x: p[3], y: p[4] }; disp.set(p[0], d); }
-    d.x += (p[3] - d.x) * 0.35; d.y += (p[4] - d.y) * 0.35;
+  reset() {
+    this.towers = [];
+    TX.forEach((x, i) => {
+      this.towers.push({ team: "b", i, x, y: H / 2, hp: 800, atk: 0, fx: 0, fy: 0, fl: 0 });
+      this.towers.push({ team: "r", i, x: W - x, y: H / 2, hp: 800, atk: 0, fx: 0, fy: 0, fl: 0 });
+    });
+    this.nex = { b: { nx: "b", x: 90, y: H / 2, hp: 1500 }, r: { nx: "r", x: W - 90, y: H / 2, hp: 1500 } };
+    this.shots = []; this.walls = []; this.minions = []; this.fx = [];
+    this.relics = [[680, 130], [680, 370], [1320, 130], [1320, 370]].map(([x, y]) => ({ x, y, cd: 0 }));
+    this.t = 0; this.over = 0; this.win = "";
+    for (const p of this.socks.values()) { p.k = 0; p.d = 0; this.spawn(p); }
   }
-  const my = disp.get(me.id) || { x: W/2, y: H/2 };
-  const vh = cv.height / scale;
-  cam.x = clamp(my.x - VW/2, 0, W - VW);
-  cam.y = H/2 - vh/2;
-  ctx.setTransform(scale, 0, 0, scale, -cam.x * scale, -cam.y * scale);
 
-  // 다리(외길): 어두운 나락 위에 얼음 다리
-  ctx.fillStyle = "#1c4a5e"; ctx.fillRect(0, 50, W, H - 100);
-  ctx.fillStyle = "#4aa3ff22"; ctx.fillRect(0, 50, 330, H - 100);
-  ctx.fillStyle = "#ff5a6a22"; ctx.fillRect(W - 330, 50, 330, H - 100);
-  ctx.fillStyle = "#ffffff12";
-  for (let x = 0; x < W; x += 100) ctx.fillRect(x, 50, 2, H - 100);
-  ctx.strokeStyle = "#cfe9f5"; ctx.lineWidth = 4;
-  ctx.strokeRect(0, 50, W, H - 100);
-
-  circle(90, H/2, 60, "#1b4f86", COL.b); bar(90, H/2 - 80, 120, snap.n[0], 1500, COL.b);
-  circle(W - 90, H/2, 60, "#862a36", COL.r); bar(W - 90, H/2 - 80, 120, snap.n[1], 1500, COL.r);
-
-  for (const T of snap.tw) {
-    if (T[2] <= 0) continue;
-    ctx.fillStyle = COL[T[0]]; ctx.fillRect(T[1] - 24, H/2 - 24, 48, 48);
-    ctx.fillStyle = "#0008"; ctx.fillRect(T[1] - 14, H/2 - 14, 28, 28);
-    bar(T[1], H/2 - 42, 56, T[2], 800, "#7fe08a");
-    if (T[3]) { ctx.strokeStyle = "#ffe27a"; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(T[1], H/2); ctx.lineTo(T[3], T[4]); ctx.stroke(); }
+  spawn(p) {
+    const c = CH[p.ch];
+    p.hp = p.max = c.hp; p.sh = 0; p.shT = 0; p.haste = 0;
+    p.x = p.team === "b" ? 200 : W - 200;
+    p.y = H / 2 + (Math.random() - 0.5) * 200;
+    p.tx = p.x; p.ty = p.y; p.dead = 0; p.cdq = 0; p.cdw = 0; p.atk = 0;
   }
-  for (const w of snap.wl) { ctx.globalAlpha = .5; circle(w[0], w[1], w[2], "#9fe3ff"); ctx.globalAlpha = 1; }
-  const now = performance.now();
-  fxs = fxs.filter((x) => now - x.t < 350);
-  for (const x of fxs) { ctx.globalAlpha = 1 - (now - x.t) / 350; circle(x.x, x.y, x.r, COL[x.team] + "55", "#fff", 2); ctx.globalAlpha = 1; }
-  for (const m of snap.m) { circle(m[1], m[2], 12, COL[m[0]] + "cc"); bar(m[1], m[2] - 22, 26, m[3], 120, "#7fe08a"); }
-  for (const s of snap.s) circle(s[0], s[1], 8, "#fff", COL[s[2]]);
 
-  for (const p of snap.p) {
-    const [id, team, nm, , , hp, max, dead, , , , , chk, sh] = p, d = disp.get(id);
-    ctx.globalAlpha = dead ? 0.25 : 1;
-    circle(d.x, d.y, 20, COL[team], id === me.id ? "#fff" : null);
-    if (sh > 0) circle(d.x, d.y, 25, null, "#fff8", 2);
-    ctx.fillStyle = "#fff"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center";
-    ctx.fillText((NAMES[chk] || "?")[0], d.x, d.y + 6);
-    ctx.globalAlpha = 1;
-    if (!dead) {
-      bar(d.x, d.y - 36, 50, hp, max, "#7fe08a");
-      ctx.font = "bold 13px sans-serif"; ctx.fillText(`${nm} (${NAMES[chk]})`, d.x, d.y - 42);
+  fetch(req) {
+    if (req.headers.get("Upgrade") !== "websocket") return new Response("ws only", { status: 426 });
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    const id = this.nid++;
+    const nb = [...this.socks.values()].filter((p) => p.team === "b").length;
+    const p = { id, ws: server, team: nb <= this.socks.size - nb ? "b" : "r", name: "P" + id, k: 0, d: 0,
+      ch: KEYS[Math.floor(Math.random() * KEYS.length)] };
+    this.spawn(p);
+    this.socks.set(id, p);
+
+    server.addEventListener("message", (e) => {
+      try {
+        const m = JSON.parse(e.data);
+        if (m.t === "name") {
+          p.name = String(m.n || "").slice(0, 10) || p.name;
+          if (CH[m.ch]) p.ch = m.ch;
+          this.spawn(p);
+          if (!this.host || !this.socks.has(this.host)) this.host = id;
+          server.send(JSON.stringify({ t: "hi", id, team: p.team, ch: p.ch, cdq: CH[p.ch].q.cd, cdw: CH[p.ch].w.cd }));
+          return;
+        }
+        if (m.t === "chat") {
+          const now = Date.now();
+          if (now - (p.lc || 0) < 500) return;
+          p.lc = now;
+          const s = String(m.m || "").slice(0, 100).trim();
+          if (s) this.bcast({ t: "chat", n: p.name, team: p.team, m: s });
+          return;
+        }
+        if (this.phase === "lobby") {
+          if (m.t === "pick" && CH[m.ch]) {
+            p.ch = m.ch; this.spawn(p);
+            server.send(JSON.stringify({ t: "hi", id, team: p.team, ch: p.ch, cdq: CH[p.ch].q.cd, cdw: CH[p.ch].w.cd }));
+          }
+          if (m.t === "team") p.team = p.team === "b" ? "r" : "b";
+          if (m.t === "start" && this.host === id) { this.phase = "play"; this.reset(); }
+          return;
+        }
+        if (p.dead > 0 || this.over) return;
+        if (m.t === "mv") { p.tx = clamp(m.x, 0, W); p.ty = clamp(m.y, 60, H - 60); }
+        if (m.t === "q" || m.t === "w") this.cast(p, m.t, +m.x || 0, +m.y || 0);
+      } catch {}
+    });
+    const bye = () => {
+      this.socks.delete(id);
+      if (this.host === id) this.host = [...this.socks.keys()][0] || 0;
+      if (!this.socks.size) { clearInterval(this.timer); this.timer = null; this.phase = "lobby"; this.reset(); }
+    };
+    server.addEventListener("close", bye);
+    server.addEventListener("error", bye);
+    if (!this.timer) this.timer = setInterval(() => this.tick(), DT * 1000);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  bcast(o) { const s = JSON.stringify(o); for (const q of this.socks.values()) { try { q.ws.send(s); } catch {} } }
+
+  cast(p, k, x, y) {
+    const s = CH[p.ch][k], cd = "cd" + k;
+    if (p[cd] > 0) return;
+    p[cd] = s.cd;
+    const a = Math.atan2(y - p.y, x - p.x);
+    const shot = (an) => this.shots.push({ x: p.x, y: p.y, vx: Math.cos(an) * s.spd, vy: Math.sin(an) * s.spd,
+      life: s.rng / s.spd, team: p.team, by: p, dmg: s.dmg, r: s.r, pierce: s.pierce, hit: new Set() });
+    const aoe = (cx, cy, rad, dmg) => {
+      for (const t of this.targets(p.team)) if (dist(cx, cy, t.x, t.y) < rad + t.r) this.hurt(t.o, dmg, p);
+      this.fx.push([Math.round(cx), Math.round(cy), rad, p.team]);
+    };
+    switch (s.k) {
+      case "shot": shot(a); break;
+      case "fan": for (let i = -1; i <= 1; i++) shot(a + i * s.ang); break;
+      case "aoeSelf": aoe(p.x, p.y, s.rad, s.dmg); break;
+      case "aoeAt": { const d = Math.min(s.rng, dist(p.x, p.y, x, y)); aoe(p.x + Math.cos(a) * d, p.y + Math.sin(a) * d, s.rad, s.dmg); break; }
+      case "shield": p.sh = s.amt; p.shT = s.dur; break;
+      case "haste": p.haste = s.dur; break;
+      case "heal": p.hp = Math.min(p.max, p.hp + s.amt); break;
+      case "wall": this.walls.push({ x: p.x + Math.cos(a) * s.rng, y: p.y + Math.sin(a) * s.rng, team: p.team, life: s.dur, rad: s.rad }); break;
     }
   }
 
-  // ---- 화면 고정 UI ----
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  // 미니맵
-  ctx.fillStyle = "#07111acc"; ctx.fillRect(mini.x, mini.y, mini.w, mini.h);
-  ctx.strokeStyle = "#cfe9f5"; ctx.lineWidth = 2; ctx.strokeRect(mini.x, mini.y, mini.w, mini.h);
-  const mx = (x) => mini.x + x / W * mini.w, my2 = (y) => mini.y + y / H * mini.h, u = mini.w / 300;
-  for (const T of snap.tw) if (T[2] > 0) { ctx.fillStyle = COL[T[0]]; ctx.fillRect(mx(T[1]) - 3*u, my2(H/2) - 3*u, 6*u, 6*u); }
-  circle(mx(90), my2(H/2), 5*u, COL.b); circle(mx(W - 90), my2(H/2), 5*u, COL.r);
-  for (const m of snap.m) circle(mx(m[1]), my2(m[2]), 1.5*u, COL[m[0]]);
-  for (const p of snap.p) if (!p[7]) { const d = disp.get(p[0]); circle(mx(d.x), my2(d.y), 3.5*u, COL[p[1]], p[0] === me.id ? "#fff" : null, 1.5*u); }
-  ctx.strokeStyle = "#fff"; ctx.lineWidth = 1; ctx.strokeRect(mx(cam.x), my2(cam.y), VW / W * mini.w, Math.min(mini.h, vh / H * mini.h));
-  // 점수판
-  ctx.textAlign = "right"; ctx.font = `${13 * dpr}px sans-serif`;
-  [...snap.p].sort((a, b) => b[8] - a[8]).slice(0, 10).forEach((p, i) => {
-    ctx.fillStyle = COL[p[1]]; ctx.fillText(`${p[2]}  ${p[8]}/${p[9]}`, cv.width - 12 * dpr, (22 + i * 17) * dpr);
-  });
-
-  const mine = snap.p.find((p) => p[0] === me.id);
-  if (mine) {
-    bq.lastChild.style.height = Math.min(100, mine[10] / (me.cdq || 1) * 100) + "%";
-    bw.lastChild.style.height = Math.min(100, mine[11] / (me.cdw || 1) * 100) + "%";
-    if (mine[7]) msg.textContent = "부활 대기 중…"; else if (!snap.win) msg.textContent = "";
+  hurt(o, dmg, by) {
+    if (o.dead > 0 || o.hp <= 0) return;
+    if (o.sh > 0) { const a = Math.min(o.sh, dmg); o.sh -= a; dmg -= a; }
+    o.hp -= dmg;
+    if (o.hp <= 0) {
+      if (o.ws) { o.dead = 5; o.d++; if (by && by.ws) by.k++; }
+      if (o.nx && !this.over) { this.over = 8; this.win = o.nx === "b" ? "r" : "b"; }
+    }
   }
-  if (snap.win) msg.innerHTML = (snap.win === "b" ? "블루팀" : "레드팀") + " 승리!<br><small style='font-size:18px'>곧 새 게임이 시작됩니다</small>";
+
+  // 공격 가능한 적: 챔피언, 미니언, 맨 앞 타워(없으면 넥서스)
+  targets(team) {
+    const en = team === "b" ? "r" : "b", list = [];
+    for (const p of this.socks.values()) if (p.team === en && p.dead <= 0) list.push({ o: p, x: p.x, y: p.y, r: 20 });
+    for (const m of this.minions) if (m.team === en && m.hp > 0) list.push({ o: m, x: m.x, y: m.y, r: 14 });
+    const tw = this.towers.filter((t) => t.team === en && t.hp > 0).sort((a, b) => a.i - b.i)[0];
+    if (tw) list.push({ o: tw, x: tw.x, y: tw.y, r: 36 });
+    else list.push({ o: this.nex[en], x: this.nex[en].x, y: this.nex[en].y, r: 60 });
+    return list;
+  }
+
+  tick() {
+    if (this.phase === "lobby") {
+      if (++this.tk % 4 === 0) this.bcast({ t: "s", ph: "lobby", host: this.host, p: [...this.socks.values()].map((p) => [p.id, p.team, p.name, p.ch]) });
+      return;
+    }
+    if (this.over) {
+      this.over -= DT;
+      if (this.over <= 0) { this.phase = "lobby"; this.reset(); }
+    } else {
+      this.t += DT;
+      if (this.t % 20 < DT) {
+        for (let i = 0; i < 4; i++) {
+          this.minions.push({ team: "b", x: 180 - i * 30, y: H / 2, hp: 120, atk: 0 });
+          this.minions.push({ team: "r", x: W - 180 + i * 30, y: H / 2, hp: 120, atk: 0 });
+        }
+      }
+      for (const p of this.socks.values()) {
+        const c = CH[p.ch];
+        p.cdq = Math.max(0, p.cdq - DT); p.cdw = Math.max(0, p.cdw - DT); p.atk -= DT;
+        p.haste = Math.max(0, p.haste - DT);
+        if (p.shT > 0) { p.shT -= DT; if (p.shT <= 0) p.sh = 0; }
+        if (p.dead > 0) { p.dead -= DT; if (p.dead <= 0) this.spawn(p); continue; }
+        if (p.team === "b" ? p.x < 260 : p.x > W - 260) p.hp = Math.min(p.max, p.hp + 40 * DT);
+        const d = dist(p.x, p.y, p.tx, p.ty), step = c.spd * (p.haste > 0 ? 1.6 : 1) * DT;
+        if (d <= step) { p.x = p.tx; p.y = p.ty; } else { p.x += ((p.tx - p.x) / d) * step; p.y += ((p.ty - p.y) / d) * step; }
+        if (p.atk <= 0) {
+          let best = null, bd = 1e9;
+          for (const t of this.targets(p.team)) {
+            const dd = dist(p.x, p.y, t.x, t.y) - t.r;
+            if (dd < c.ar && dd < bd) { best = t; bd = dd; }
+          }
+          if (best) { this.hurt(best.o, c.ad, p); p.atk = 0.8; }
+        }
+      }
+      for (const q of this.relics) {
+        q.cd = Math.max(0, q.cd - DT);
+        if (q.cd > 0) continue;
+        for (const p of this.socks.values()) {
+          if (p.dead <= 0 && p.hp < p.max && dist(p.x, p.y, q.x, q.y) < 36) { p.hp = Math.min(p.max, p.hp + 150); q.cd = 30; break; }
+        }
+      }
+      for (const T of this.towers) {
+        if (T.hp <= 0) continue;
+        T.atk -= DT; T.fl -= DT;
+        if (T.atk > 0) continue;
+        let best = null, bd = 1e9, mn = false;
+        for (const m of this.minions) {
+          if (m.team === T.team || m.hp <= 0) continue;
+          const d = dist(T.x, T.y, m.x, m.y);
+          if (d < 270 && d < bd) { best = m; bd = d; mn = true; }
+        }
+        if (!best) for (const p of this.socks.values()) {
+          if (p.team === T.team || p.dead > 0) continue;
+          const d = dist(T.x, T.y, p.x, p.y);
+          if (d < 270 && d < bd) { best = p; bd = d; }
+        }
+        if (best) { this.hurt(best, mn ? 70 : 45, null); T.atk = 1; T.fx = best.x; T.fy = best.y; T.fl = 0.2; }
+      }
+      for (const m of this.minions) {
+        m.atk -= DT;
+        let best = null, bd = 1e9;
+        for (const t of this.targets(m.team)) {
+          const dd = dist(m.x, m.y, t.x, t.y) - t.r;
+          if (dd < bd) { best = t; bd = dd; }
+        }
+        if (best && bd < 50) { if (m.atk <= 0) { this.hurt(best.o, 10, m); m.atk = 1; } }
+        else m.x += (m.team === "b" ? 1 : -1) * 70 * DT;
+      }
+      for (const w of this.walls) w.life -= DT;
+      this.walls = this.walls.filter((w) => w.life > 0);
+      for (const s of this.shots) {
+        s.x += s.vx * DT; s.y += s.vy * DT; s.life -= DT;
+        if (this.walls.some((w) => w.team !== s.team && dist(s.x, s.y, w.x, w.y) < w.rad)) { s.life = 0; continue; }
+        for (const t of this.targets(s.team)) {
+          if (s.hit.has(t.o)) continue;
+          if (dist(s.x, s.y, t.x, t.y) < t.r + s.r) {
+            this.hurt(t.o, s.dmg, s.by); s.hit.add(t.o);
+            if (!s.pierce) { s.life = 0; break; }
+          }
+        }
+      }
+      this.shots = this.shots.filter((s) => s.life > 0);
+      this.minions = this.minions.filter((m) => m.hp > 0);
+    }
+    const r = Math.round;
+    const msg = JSON.stringify({
+      t: "s",
+      p: [...this.socks.values()].map((p) => [p.id, p.team, p.name, r(p.x), r(p.y), r(p.hp), p.max, p.dead > 0 ? 1 : 0, p.k, p.d, +p.cdq.toFixed(1), +p.cdw.toFixed(1), p.ch, r(p.sh)]),
+      m: this.minions.map((m) => [m.team, r(m.x), r(m.y), r(m.hp)]),
+      s: this.shots.map((s) => [r(s.x), r(s.y), s.team]),
+      tw: this.towers.map((T) => [T.team, T.x, r(T.hp), T.fl > 0 ? r(T.fx) : 0, T.fl > 0 ? r(T.fy) : 0]),
+      wl: this.walls.map((w) => [r(w.x), r(w.y), w.rad, w.team]),
+      fx: this.fx,
+      n: [this.nex.b.hp, this.nex.r.hp],
+      win: this.win, ph: "play", host: this.host, tm: Math.round(this.t),
+      rl: this.relics.map((q) => (q.cd <= 0 ? 1 : 0)),
+    });
+    this.fx = [];
+    for (const p of this.socks.values()) { try { p.ws.send(msg); } catch {} }
+  }
 }
-draw();
-</script>
-</body>
-</html>
